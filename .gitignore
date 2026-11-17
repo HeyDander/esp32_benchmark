@@ -1,0 +1,19 @@
+# Local credentials
+firmware/config.h
+.env
+.env.*
+!.env.example
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Arduino IDE
+*.elf
+*.hex
+*.bin
+*.map
+**/config.h
