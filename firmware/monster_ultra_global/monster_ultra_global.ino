@@ -1,491 +1,766 @@
-/*
-  MONSTER ULTRA GLOBAL — ESP32 firmware
-  Version: 0.1.0
-  Board: ESP32-WROOM-32
 
-  Runs a repeatable set of lightweight tests and uploads the results
-  to the user's MONSTER ULTRA GLOBAL API.
+/*
+  MONSTER ULTRA GLOBAL v0.2.0
+  Target: ESP32-WROOM-32
+  Arduino ESP32 Core 2.x / 3.x
+
+  CPU Integer / Float / Math
+  RAM Read / Write / Copy
+  Dual Core
+  FreeRTOS Yield Rate
+  Stability / Heap
+  WiFi / HTTPS Upload
 
   IMPORTANT:
-  - Copy config.example.h to config.h and fill in your own settings.
-  - Never commit config.h or publish your upload token.
-  - The v0.1.0 score is experimental. Compare only identical benchmark versions.
+  setInsecure() disables TLS certificate verification.
+  Use only as a simplified test configuration.
 */
 
+#include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <esp_system.h>
+#include <esp_chip_info.h>
 #include <math.h>
 #include <string.h>
-#include "config.h"
 
-static const char* BOARD_MODEL = "ESP32-WROOM-32";
-static const char* CHIP_MODEL = "ESP32-D0WD-V3";
-static const char* BENCHMARK_VERSION = "MONSTER-ULTRA-GLOBAL-0.1.0";
+// =====================================================
+// CONFIGURATION — EDIT THESE 4 VALUES
+// =====================================================
 
-static const uint32_t TEST_DURATION_MS = 1200;
-static const uint32_t STABILITY_DURATION_MS = 3000;
+#define WIFI_SSID       "your_wifi"
+#define WIFI_PASSWORD   "your_wifi_password"
+//use this token and domain for publish your results
+#define SERVER_URL      "https://esp32-benchmarksite.onrender.com/api/benchmark"
+#define UPLOAD_TOKEN    "9b12763b31c8d9254170254bcd47f15441e7b88b4788b5069a40cc1c670d691a"
 
-static volatile uint32_t gIntSink = 0;
-static volatile float gFloatSink = 0.0f;
-static volatile uint32_t gRamSink = 0;
+#define BOARD_MODEL     "ESP32-WROOM-32"
 
-static uint32_t cpuIntRate = 0;
-static uint32_t cpuFloatRate = 0;
-static uint32_t cpuMathRate = 0;
-static uint32_t multicoreRate = 0;
-static double ramReadMBps = 0.0;
-static double ramWriteMBps = 0.0;
-static double ramCopyMBps = 0.0;
-static uint32_t freertosSwitches = 0;
-static uint32_t stabilitySeconds = 0;
-static uint32_t minFreeHeap = UINT32_MAX;
-static uint32_t monsterScore = 0;
+static const char* VERSION =
+  "MONSTER-ULTRA-GLOBAL-0.2.0";
 
-// Two small buffers kept in internal SRAM.
-static uint32_t ramSource[2048];
-static uint32_t ramDestination[2048];
+static const uint32_t TEST_MS = 1200;
+static const uint32_t STABILITY_MS = 3000;
 
-static volatile bool multiRunning = false;
-static volatile bool multiWorkerDone = true;
-static volatile uint32_t multiCore0Count = 0;
-static volatile uint32_t multiCore1Count = 0;
+static const size_t RAM_WORDS = 2048;
 
-static uint32_t elapsedRate(uint32_t count, uint32_t elapsedMs) {
-  if (elapsedMs == 0) return 0;
-  return (uint32_t)(((uint64_t)count * 1000ULL) / elapsedMs);
+// =====================================================
+// RESULTS
+// =====================================================
+
+volatile uint32_t intSink = 0;
+volatile float floatSink = 0;
+volatile uint32_t ramSink = 0;
+
+uint32_t cpuInt = 0;
+uint32_t cpuFloat = 0;
+uint32_t cpuMath = 0;
+
+uint32_t multicore = 0;
+uint32_t yieldRate = 0;
+
+double ramRead = 0;
+double ramWrite = 0;
+double ramCopy = 0;
+
+uint32_t minHeap = UINT32_MAX;
+uint32_t stabilitySeconds = 0;
+
+uint32_t monsterScore = 0;
+
+uint32_t ramA[RAM_WORDS];
+uint32_t ramB[RAM_WORDS];
+
+// =====================================================
+// MULTICORE SYNCHRONIZATION
+// =====================================================
+
+portMUX_TYPE multiMux = portMUX_INITIALIZER_UNLOCKED;
+
+bool workerRunning = false;
+bool workerFinished = true;
+
+uint32_t workerIterations = 0;
+
+// =====================================================
+// HELPERS
+// =====================================================
+
+uint32_t ratePerSecond(uint64_t count, uint32_t ms) {
+  if (ms == 0) return 0;
+  return (uint32_t)(count * 1000ULL / ms);
 }
 
-static uint32_t runCpuIntegerTest(uint32_t durationMs) {
-  uint32_t x = 0x12345678U;
-  uint32_t y = 0x9E3779B9U;
-  uint32_t iterations = 0;
-  const uint32_t started = millis();
+double mbPerSecond(uint64_t bytes, uint32_t ms) {
+  if (ms == 0) return 0;
+  return ((double)bytes * 1000.0) /
+         ((double)ms * 1000000.0);
+}
 
-  while ((uint32_t)(millis() - started) < durationMs) {
-    for (uint16_t i = 0; i < 1024; ++i) {
+String chipName() {
+  String s = ESP.getChipModel();
+  s += "-REV";
+  s += String(ESP.getChipRevision());
+  return s;
+}
+
+// =====================================================
+// SYSTEM INFO
+// =====================================================
+
+void printResetReason() {
+  esp_reset_reason_t reason = esp_reset_reason();
+
+  Serial.print("[SYSTEM] Reset reason: ");
+
+  switch (reason) {
+    case ESP_RST_POWERON:
+      Serial.println("POWER ON");
+      break;
+    case ESP_RST_EXT:
+      Serial.println("EXTERNAL RESET");
+      break;
+    case ESP_RST_SW:
+      Serial.println("SOFTWARE RESET");
+      break;
+    case ESP_RST_PANIC:
+      Serial.println("PANIC");
+      break;
+    case ESP_RST_INT_WDT:
+      Serial.println("INTERRUPT WATCHDOG");
+      break;
+    case ESP_RST_TASK_WDT:
+      Serial.println("TASK WATCHDOG");
+      break;
+    case ESP_RST_WDT:
+      Serial.println("WATCHDOG");
+      break;
+    case ESP_RST_DEEPSLEEP:
+      Serial.println("DEEP SLEEP");
+      break;
+    case ESP_RST_BROWNOUT:
+      Serial.println("BROWNOUT");
+      break;
+    default:
+      Serial.printf("OTHER (%d)\n", (int)reason);
+      break;
+  }
+}
+
+void printHardware() {
+  esp_chip_info_t info;
+  esp_chip_info(&info);
+
+  Serial.println("\n========== HARDWARE ==========");
+
+  Serial.printf("Board: %s\n", BOARD_MODEL);
+  Serial.printf("Chip: %s\n", chipName().c_str());
+  Serial.printf("CPU: %u MHz\n", ESP.getCpuFreqMHz());
+  Serial.printf("Cores: %u\n", info.cores);
+  Serial.printf("Flash: %u bytes\n", ESP.getFlashChipSize());
+  Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
+
+  Serial.println("==============================\n");
+}
+
+// =====================================================
+// CPU INTEGER
+// =====================================================
+
+uint32_t testInteger() {
+  uint32_t x = 0x12345678;
+  uint32_t y = 0x9E3779B9;
+  uint64_t count = 0;
+
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < TEST_MS) {
+    for (int i = 0; i < 1024; i++) {
       x ^= x << 13;
       x ^= x >> 17;
       x ^= x << 5;
-      y += (x ^ (iterations * 0x45D9F3BU));
-      ++iterations;
+      y += x ^ (uint32_t)count;
+      count++;
     }
     taskYIELD();
   }
 
-  gIntSink = x ^ y;
-  return elapsedRate(iterations, millis() - started);
+  intSink = x ^ y;
+  return ratePerSecond(count, millis() - start);
 }
 
-static uint32_t runCpuFloatTest(uint32_t durationMs) {
+// =====================================================
+// CPU FLOAT
+// =====================================================
+
+uint32_t testFloat() {
   float a = 1.000123f;
   float b = 0.999731f;
   float c = 0.314159f;
-  uint32_t iterations = 0;
-  const uint32_t started = millis();
 
-  while ((uint32_t)(millis() - started) < durationMs) {
-    for (uint16_t i = 0; i < 1024; ++i) {
-      a = (a * 1.000001f) + (b * 0.000013f);
-      b = (b * 0.999997f) + (c * 0.000017f);
+  uint64_t count = 0;
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < TEST_MS) {
+    for (int i = 0; i < 1024; i++) {
+      a = a * 1.000001f + b * 0.000013f;
+      b = b * 0.999997f + c * 0.000017f;
       c = (c + 0.000031f) * 0.999991f;
-      ++iterations;
+      count++;
     }
     taskYIELD();
   }
 
-  gFloatSink = a + b + c;
-  return elapsedRate(iterations, millis() - started);
+  floatSink = a + b + c;
+  return ratePerSecond(count, millis() - start);
 }
 
-static uint32_t runCpuMathTest(uint32_t durationMs) {
-  float x = 0.12345f;
-  float result = 0.0f;
-  uint32_t iterations = 0;
-  const uint32_t started = millis();
+// =====================================================
+// CPU MATH
+// =====================================================
 
-  while ((uint32_t)(millis() - started) < durationMs) {
-    for (uint16_t i = 0; i < 128; ++i) {
+uint32_t testMath() {
+  float x = 0.12345f;
+  float result = 0;
+
+  uint64_t count = 0;
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < TEST_MS) {
+    for (int i = 0; i < 128; i++) {
       x += 0.00073f;
       if (x > 6.0f) x -= 6.0f;
-      result += sinf(x) + cosf(x * 0.7f) + sqrtf(x + 0.01f);
-      ++iterations;
+
+      result += sinf(x) + cosf(x * 0.7f)
+                + sqrtf(x + 0.01f);
+
+      count++;
     }
     taskYIELD();
   }
 
-  gFloatSink = result;
-  return elapsedRate(iterations, millis() - started);
+  floatSink = result;
+  return ratePerSecond(count, millis() - start);
 }
 
-static double runRamReadTest(uint32_t durationMs) {
+// =====================================================
+// RAM TESTS
+// =====================================================
+
+double testRamRead() {
   uint32_t sum = 0;
   uint64_t bytes = 0;
-  const size_t bufferBytes = sizeof(ramSource);
-  const uint32_t started = millis();
 
-  while ((uint32_t)(millis() - started) < durationMs) {
-    for (size_t i = 0; i < 2048; ++i) {
-      sum += ramSource[i];
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < TEST_MS) {
+    for (size_t i = 0; i < RAM_WORDS; i++) {
+      sum += ramA[i];
     }
-    bytes += bufferBytes;
+    bytes += sizeof(ramA);
     taskYIELD();
   }
 
-  const uint32_t elapsed = millis() - started;
-  gRamSink = sum;
-  if (elapsed == 0) return 0.0;
-  return ((double)bytes * 1000.0) / ((double)elapsed * 1000000.0);
+  uint32_t elapsed = millis() - start;
+  ramSink = sum;
+
+  return mbPerSecond(bytes, elapsed);
 }
 
-static double runRamWriteTest(uint32_t durationMs) {
-  uint32_t value = 0xA5A5A5A5U;
+double testRamWrite() {
+  uint32_t value = 0xA5A5A5A5;
   uint64_t bytes = 0;
-  const size_t bufferBytes = sizeof(ramSource);
-  const uint32_t started = millis();
 
-  while ((uint32_t)(millis() - started) < durationMs) {
-    for (size_t i = 0; i < 2048; ++i) {
-      ramSource[i] = value + (uint32_t)i;
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < TEST_MS) {
+    for (size_t i = 0; i < RAM_WORDS; i++) {
+      ramA[i] = value + i;
     }
+
     value = (value << 1) | (value >> 31);
-    bytes += bufferBytes;
+    bytes += sizeof(ramA);
     taskYIELD();
   }
 
-  const uint32_t elapsed = millis() - started;
-  gRamSink = ramSource[0];
-  if (elapsed == 0) return 0.0;
-  return ((double)bytes * 1000.0) / ((double)elapsed * 1000000.0);
+  uint32_t elapsed = millis() - start;
+  ramSink = ramA[0];
+
+  return mbPerSecond(bytes, elapsed);
 }
 
-static double runRamCopyTest(uint32_t durationMs) {
+double testRamCopy() {
   uint64_t bytes = 0;
-  const size_t bufferBytes = sizeof(ramSource);
-  const uint32_t started = millis();
 
-  while ((uint32_t)(millis() - started) < durationMs) {
-    memcpy(ramDestination, ramSource, bufferBytes);
-    bytes += bufferBytes;
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < TEST_MS) {
+    memcpy(ramB, ramA, sizeof(ramA));
+    bytes += sizeof(ramA);
     taskYIELD();
   }
 
-  const uint32_t elapsed = millis() - started;
-  gRamSink = ramDestination[2047];
-  if (elapsed == 0) return 0.0;
-  return ((double)bytes * 1000.0) / ((double)elapsed * 1000000.0);
+  uint32_t elapsed = millis() - start;
+  ramSink = ramB[RAM_WORDS - 1];
+
+  return mbPerSecond(bytes, elapsed);
 }
 
-static void multicoreWorker(void* parameter) {
+// =====================================================
+// MULTICORE WORKER
+// =====================================================
+
+void multicoreWorker(void* parameter) {
   (void)parameter;
-  uint32_t x = 0xCAFEBABEU;
 
-  while (multiRunning) {
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    ++multiCore1Count;
+  uint32_t x = 0xCAFEBABE;
+  uint32_t localCount = 0;
 
-    if ((multiCore1Count & 0x3FFFU) == 0) {
-      taskYIELD();
+  while (true) {
+    for (int i = 0; i < 16384; i++) {
+      x ^= x << 13;
+      x ^= x >> 17;
+      x ^= x << 5;
+      localCount++;
     }
+
+    bool running;
+
+    portENTER_CRITICAL(&multiMux);
+    running = workerRunning;
+    portEXIT_CRITICAL(&multiMux);
+
+    if (!running) break;
+
+    taskYIELD();
   }
 
-  gIntSink = x;
-  multiWorkerDone = true;
+  intSink = x;
+
+  portENTER_CRITICAL(&multiMux);
+  workerIterations = localCount;
+  workerFinished = true;
+  portEXIT_CRITICAL(&multiMux);
+
   vTaskDelete(NULL);
 }
 
-static uint32_t runMulticoreTest(uint32_t durationMs) {
-  multiCore0Count = 0;
-  multiCore1Count = 0;
-  multiWorkerDone = false;
-  multiRunning = true;
+// =====================================================
+// MULTICORE TEST
+// =====================================================
+
+uint32_t testMulticore() {
+#if defined(CONFIG_FREERTOS_UNICORE) && CONFIG_FREERTOS_UNICORE
+  Serial.println("[MULTICORE] Single-core build. Skipped.");
+  return 0;
+#else
+
+  int mainCore = xPortGetCoreID();
+  int workerCore = (mainCore == 0) ? 1 : 0;
+
+  portENTER_CRITICAL(&multiMux);
+  workerRunning = true;
+  workerFinished = false;
+  workerIterations = 0;
+  portEXIT_CRITICAL(&multiMux);
 
   BaseType_t created = xTaskCreatePinnedToCore(
     multicoreWorker,
-    "MonsterCore1",
+    "MonsterWorker",
     4096,
-    nullptr,
+    NULL,
     1,
-    nullptr,
-    1
+    NULL,
+    workerCore
   );
 
   if (created != pdPASS) {
-    multiRunning = false;
-    multiWorkerDone = true;
-    Serial.println("[WARN] Could not create second-core benchmark task.");
+    portENTER_CRITICAL(&multiMux);
+    workerRunning = false;
+    workerFinished = true;
+    portEXIT_CRITICAL(&multiMux);
+
+    Serial.println("[MULTICORE] Worker creation failed.");
     return 0;
   }
 
-  const uint32_t started = millis();
-  uint32_t x = 0x13579BDFU;
+  Serial.printf("[MULTICORE] Main core: %d\n", mainCore);
+  Serial.printf("[MULTICORE] Worker core: %d\n", workerCore);
 
-  while ((uint32_t)(millis() - started) < durationMs) {
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    ++multiCore0Count;
+  uint32_t x = 0x13579BDF;
+  uint64_t localCount = 0;
 
-    if ((multiCore0Count & 0x3FFFU) == 0) {
-      taskYIELD();
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < TEST_MS) {
+    for (int i = 0; i < 16384; i++) {
+      x ^= x << 13;
+      x ^= x >> 17;
+      x ^= x << 5;
+      localCount++;
     }
+    taskYIELD();
   }
 
-  multiRunning = false;
+  uint32_t elapsed = millis() - start;
 
-  const uint32_t waitStarted = millis();
-  while (!multiWorkerDone && (uint32_t)(millis() - waitStarted) < 1000) {
+  portENTER_CRITICAL(&multiMux);
+  workerRunning = false;
+  portEXIT_CRITICAL(&multiMux);
+
+  uint32_t waitStart = millis();
+  bool done = false;
+
+  while ((uint32_t)(millis() - waitStart) < 1000) {
+    portENTER_CRITICAL(&multiMux);
+    done = workerFinished;
+    portEXIT_CRITICAL(&multiMux);
+
+    if (done) break;
     delay(1);
   }
 
-  gIntSink = x;
-  const uint32_t total = multiCore0Count + multiCore1Count;
-  return elapsedRate(total, millis() - started);
-}
-
-static uint32_t runFreeRtosYieldTest(uint32_t durationMs) {
-  uint32_t switches = 0;
-  const uint32_t started = millis();
-
-  while ((uint32_t)(millis() - started) < durationMs) {
-    taskYIELD();
-    ++switches;
+  if (!done) {
+    Serial.println("[MULTICORE] Worker timeout.");
+    return 0;
   }
 
-  return elapsedRate(switches, millis() - started);
+  uint32_t otherCount;
+
+  portENTER_CRITICAL(&multiMux);
+  otherCount = workerIterations;
+  portEXIT_CRITICAL(&multiMux);
+
+  intSink = x;
+
+  return ratePerSecond(localCount + otherCount, elapsed);
+
+#endif
 }
 
-static void runStabilityTest(uint32_t durationMs) {
-  uint32_t x = 0x10203040U;
-  minFreeHeap = ESP.getFreeHeap();
-  const uint32_t started = millis();
-  uint32_t lastHeapCheck = started;
+// =====================================================
+// FREERTOS YIELD RATE
+// =====================================================
 
-  while ((uint32_t)(millis() - started) < durationMs) {
+uint32_t testYieldRate() {
+  uint64_t count = 0;
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < TEST_MS) {
+    taskYIELD();
+    count++;
+  }
+
+  return ratePerSecond(count, millis() - start);
+}
+
+// =====================================================
+// STABILITY TEST
+// =====================================================
+
+void testStability() {
+  uint32_t x = 0x10203040;
+
+  minHeap = ESP.getFreeHeap();
+
+  uint32_t start = millis();
+  uint32_t lastCheck = start;
+
+  while ((uint32_t)(millis() - start) < STABILITY_MS) {
     x ^= x << 13;
     x ^= x >> 17;
     x ^= x << 5;
 
-    const uint32_t now = millis();
-    if ((uint32_t)(now - lastHeapCheck) >= 250) {
-      const uint32_t heapNow = ESP.getFreeHeap();
-      if (heapNow < minFreeHeap) minFreeHeap = heapNow;
-      lastHeapCheck = now;
+    uint32_t now = millis();
+
+    if ((uint32_t)(now - lastCheck) >= 250) {
+      uint32_t heap = ESP.getFreeHeap();
+
+      if (heap < minHeap) minHeap = heap;
+
+      lastCheck = now;
       taskYIELD();
     }
   }
 
-  gIntSink = x;
-  stabilitySeconds = (millis() - started) / 1000U;
-  const uint32_t finalHeap = ESP.getFreeHeap();
-  if (finalHeap < minFreeHeap) minFreeHeap = finalHeap;
+  intSink = x;
+
+  stabilitySeconds = (millis() - start) / 1000;
+
+  uint32_t finalHeap = ESP.getFreeHeap();
+  if (finalHeap < minHeap) minHeap = finalHeap;
 }
 
-static uint32_t calculateMonsterScore() {
-  // Experimental v0.1.0 reference anchors.
-  // Keep these fixed within a benchmark version; recalibrate before a public ranking.
+// =====================================================
+// SCORE
+// =====================================================
+
+uint32_t calculateScore() {
+  /*
+    Experimental reference values.
+    Not yet calibrated for a public global ranking.
+  */
+
   const float refs[7] = {
-    1000000.0f,  // CPU integer iterations/s
-    300000.0f,   // CPU float iterations/s
-    20000.0f,    // CPU math iterations/s
-    1500000.0f,  // multicore iterations/s
-    100.0f,      // RAM read MB/s
-    100.0f,      // RAM write MB/s
-    100.0f       // RAM copy MB/s
+    1000000.0f,
+    300000.0f,
+    20000.0f,
+    1500000.0f,
+    100.0f,
+    100.0f,
+    100.0f
   };
 
   const float values[7] = {
-    (float)cpuIntRate,
-    (float)cpuFloatRate,
-    (float)cpuMathRate,
-    (float)multicoreRate,
-    (float)ramReadMBps,
-    (float)ramWriteMBps,
-    (float)ramCopyMBps
+    (float)cpuInt,
+    (float)cpuFloat,
+    (float)cpuMath,
+    (float)multicore,
+    (float)ramRead,
+    (float)ramWrite,
+    (float)ramCopy
   };
 
-  float logSum = 0.0f;
-  for (uint8_t i = 0; i < 7; ++i) {
+  float logSum = 0;
+
+  for (int i = 0; i < 7; i++) {
     float ratio = values[i] / refs[i];
+
     if (ratio < 0.001f) ratio = 0.001f;
+
     logSum += logf(ratio);
   }
 
-  const float geometricMean = expf(logSum / 7.0f);
-  const float score = 1000.0f * geometricMean;
+  float score = 1000.0f * expf(logSum / 7.0f);
 
-  if (!isfinite(score) || score < 0.0f) return 0;
+  if (!isfinite(score) || score < 0) return 0;
   if (score > 2000000000.0f) return 2000000000UL;
+
   return (uint32_t)(score + 0.5f);
 }
 
-static void printResults() {
-  Serial.println();
-  Serial.println("========== MONSTER ULTRA RESULTS ==========");
-  Serial.printf("CPU Integer : %lu iterations/s\n", (unsigned long)cpuIntRate);
-  Serial.printf("CPU Float   : %lu iterations/s\n", (unsigned long)cpuFloatRate);
-  Serial.printf("CPU Math    : %lu iterations/s\n", (unsigned long)cpuMathRate);
-  Serial.printf("Multicore   : %lu iterations/s\n", (unsigned long)multicoreRate);
-  Serial.printf("RAM Read    : %.2f MB/s\n", ramReadMBps);
-  Serial.printf("RAM Write   : %.2f MB/s\n", ramWriteMBps);
-  Serial.printf("RAM Copy    : %.2f MB/s\n", ramCopyMBps);
-  Serial.printf("FreeRTOS    : %lu yields/s\n", (unsigned long)freertosSwitches);
-  Serial.printf("Stability   : %lu seconds\n", (unsigned long)stabilitySeconds);
-  Serial.printf("Min heap    : %lu bytes\n", (unsigned long)minFreeHeap);
-  Serial.printf("MONSTER SCORE: %lu\n", (unsigned long)monsterScore);
-  Serial.println("===========================================");
-  Serial.println();
+// =====================================================
+// PRINT RESULTS
+// =====================================================
+
+void printResults() {
+  Serial.println("\n========== MONSTER RESULTS ==========");
+
+  Serial.printf("CPU Integer: %lu ops/s\n", (unsigned long)cpuInt);
+  Serial.printf("CPU Float: %lu ops/s\n", (unsigned long)cpuFloat);
+  Serial.printf("CPU Math: %lu ops/s\n", (unsigned long)cpuMath);
+
+  Serial.printf("Multicore: %lu ops/s\n", (unsigned long)multicore);
+
+  Serial.printf("RAM Read: %.2f MB/s\n", ramRead);
+  Serial.printf("RAM Write: %.2f MB/s\n", ramWrite);
+  Serial.printf("RAM Copy: %.2f MB/s\n", ramCopy);
+
+  Serial.printf("FreeRTOS Yield Rate: %lu yields/s\n",
+                (unsigned long)yieldRate);
+
+  Serial.printf("Stability: %lu seconds\n",
+                (unsigned long)stabilitySeconds);
+
+  Serial.printf("Minimum Free Heap: %lu bytes\n",
+                (unsigned long)minHeap);
+
+  Serial.printf("MONSTER SCORE: %lu\n",
+                (unsigned long)monsterScore);
+
+  Serial.println("=====================================\n");
 }
 
-static bool connectWiFi() {
-  Serial.printf("[WiFi] Connecting to: %s\n", WIFI_SSID);
+// =====================================================
+// WIFI
+// =====================================================
+
+bool connectWiFi() {
+  Serial.printf("[WIFI] Connecting to %s\n", WIFI_SSID);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  const uint32_t started = millis();
+  uint32_t start = millis();
+
   while (WiFi.status() != WL_CONNECTED &&
-         (uint32_t)(millis() - started) < 25000) {
+         (uint32_t)(millis() - start) < 20000) {
     delay(500);
     Serial.print(".");
   }
+
   Serial.println();
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Connection failed. Results remain in Serial Monitor.");
+    Serial.println("[WIFI] Connection failed.");
+    WiFi.disconnect();
     return false;
   }
 
-  Serial.println("[WiFi] Connected.");
-  Serial.print("[WiFi] ESP32 IP: ");
+  Serial.println("[WIFI] Connected.");
+  Serial.print("[WIFI] IP: ");
   Serial.println(WiFi.localIP());
+
   return true;
 }
 
-static bool uploadResults() {
+// =====================================================
+// JSON UPLOAD
+// =====================================================
+
+bool uploadResults() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[UPLOAD] No Wi-Fi connection.");
+    Serial.println("[UPLOAD] No WiFi.");
     return false;
   }
 
-  WiFiClient client;
+  if (strncmp(SERVER_URL, "https://", 8) != 0) {
+    Serial.println("[UPLOAD] SERVER_URL must use HTTPS.");
+    return false;
+  }
+
+  WiFiClientSecure client;
+
+  // Simplified TLS mode; server identity is not verified.
+  client.setInsecure();
+
   HTTPClient http;
   http.setTimeout(12000);
 
-  Serial.println("[UPLOAD] Sending benchmark results...");
-
   if (!http.begin(client, SERVER_URL)) {
-    Serial.println("[UPLOAD] Could not initialize HTTP connection.");
+    Serial.println("[UPLOAD] HTTPS initialization failed.");
     return false;
   }
 
-  String authorization = "Bearer ";
-  authorization += UPLOAD_TOKEN;
-
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", authorization);
+  http.addHeader(
+    "Authorization",
+    String("Bearer ") + UPLOAD_TOKEN
+  );
 
   String json;
-  json.reserve(700);
+  json.reserve(800);
+
   json += "{";
-  json += "\"board_model\":\"";
-  json += BOARD_MODEL;
-  json += "\",\"chip_model\":\"";
-  json += CHIP_MODEL;
-  json += "\",\"benchmark_version\":\"";
-  json += BENCHMARK_VERSION;
-  json += "\",\"score\":";
-  json += String(monsterScore);
-  json += ",\"cpu_int_ops\":";
-  json += String(cpuIntRate);
-  json += ",\"cpu_float_ops\":";
-  json += String(cpuFloatRate);
-  json += ",\"cpu_math_ops\":";
-  json += String(cpuMathRate);
-  json += ",\"multicore_ops\":";
-  json += String(multicoreRate);
-  json += ",\"ram_read_mbps\":";
-  json += String(ramReadMBps, 2);
-  json += ",\"ram_write_mbps\":";
-  json += String(ramWriteMBps, 2);
-  json += ",\"ram_copy_mbps\":";
-  json += String(ramCopyMBps, 2);
-  json += ",\"freertos_switches_s\":";
-  json += String(freertosSwitches);
-  json += ",\"stability_seconds\":";
-  json += String(stabilitySeconds);
-  json += ",\"min_free_heap_bytes\":";
-  json += String(minFreeHeap);
+
+  json += "\"board_model\":\"" + String(BOARD_MODEL) + "\",";
+  json += "\"chip_model\":\"" + chipName() + "\",";
+  json += "\"benchmark_version\":\"" + String(VERSION) + "\",";
+
+  json += "\"score\":" + String(monsterScore) + ",";
+  json += "\"cpu_int_ops\":" + String(cpuInt) + ",";
+  json += "\"cpu_float_ops\":" + String(cpuFloat) + ",";
+  json += "\"cpu_math_ops\":" + String(cpuMath) + ",";
+  json += "\"multicore_ops\":" + String(multicore) + ",";
+
+  json += "\"ram_read_mbps\":" + String(ramRead, 2) + ",";
+  json += "\"ram_write_mbps\":" + String(ramWrite, 2) + ",";
+  json += "\"ram_copy_mbps\":" + String(ramCopy, 2) + ",";
+
+  json += "\"freertos_yields_s\":" + String(yieldRate) + ",";
+  json += "\"stability_seconds\":" + String(stabilitySeconds) + ",";
+  json += "\"min_free_heap_bytes\":" + String(minHeap);
+
   json += "}";
 
-  const int responseCode = http.POST(json);
-  Serial.printf("[UPLOAD] HTTP response: %d\n", responseCode);
+  Serial.println("[UPLOAD] Sending results...");
 
-  if (responseCode > 0) {
+  int code = http.POST(json);
+
+  Serial.printf("[UPLOAD] HTTP code: %d\n", code);
+
+  bool success = false;
+
+  if (code > 0) {
+    String response = http.getString();
     Serial.println("[UPLOAD] Server response:");
-    Serial.println(http.getString());
+    Serial.println(response);
+
+    success = (code >= 200 && code < 300);
   } else {
-    Serial.printf("[UPLOAD] Error: %s\n", http.errorToString(responseCode).c_str());
+    Serial.println(http.errorToString(code));
   }
 
   http.end();
-  return responseCode >= 200 && responseCode < 300;
+
+  if (success) {
+    Serial.println("[UPLOAD] Successful.");
+  } else {
+    Serial.println("[UPLOAD] Failed.");
+  }
+
+  return success;
 }
+
+// =====================================================
+// SETUP
+// =====================================================
 
 void setup() {
   Serial.begin(115200);
   delay(1200);
 
   Serial.println();
-  Serial.println("  __  __  ____  _   _ ____ _____ _____ ____");
-  Serial.println(" |  \\/  |/ ___|| \\ | / ___|_   _| ____|  _ \\");
-  Serial.println(" | |\\/| | |  _ |  \\| \\___ \\ | | |  _| | |_) |");
-  Serial.println(" | |  | | |_| || |\\  |___) || | | |___|  _ <");
-  Serial.println(" |_|  |_|\\____||_| \\_|____/ |_| |_____|_| \\_\\");
-  Serial.println("          MONSTER ULTRA GLOBAL v0.1.0");
-  Serial.println();
+  Serial.println("========================================");
+  Serial.println("       MONSTER ULTRA GLOBAL");
+  Serial.println("              v0.2.0");
+  Serial.println("========================================");
 
-  for (size_t i = 0; i < 2048; ++i) {
-    ramSource[i] = (uint32_t)(i * 2654435761UL);
-    ramDestination[i] = 0;
+  printResetReason();
+  printHardware();
+
+  Serial.println("[SYSTEM] Initializing RAM...");
+
+  for (size_t i = 0; i < RAM_WORDS; i++) {
+    ramA[i] = (uint32_t)(i * 2654435761UL);
+    ramB[i] = 0;
   }
 
   Serial.println("[1/8] CPU Integer...");
-  cpuIntRate = runCpuIntegerTest(TEST_DURATION_MS);
+  cpuInt = testInteger();
 
   Serial.println("[2/8] CPU Float...");
-  cpuFloatRate = runCpuFloatTest(TEST_DURATION_MS);
+  cpuFloat = testFloat();
 
   Serial.println("[3/8] CPU Math...");
-  cpuMathRate = runCpuMathTest(TEST_DURATION_MS);
+  cpuMath = testMath();
 
   Serial.println("[4/8] RAM Read...");
-  ramReadMBps = runRamReadTest(TEST_DURATION_MS);
+  ramRead = testRamRead();
 
   Serial.println("[5/8] RAM Write...");
-  ramWriteMBps = runRamWriteTest(TEST_DURATION_MS);
+  ramWrite = testRamWrite();
 
   Serial.println("[6/8] RAM Copy...");
-  ramCopyMBps = runRamCopyTest(TEST_DURATION_MS);
+  ramCopy = testRamCopy();
 
-  Serial.println("[7/8] Multicore + FreeRTOS...");
-  multicoreRate = runMulticoreTest(TEST_DURATION_MS);
-  freertosSwitches = runFreeRtosYieldTest(TEST_DURATION_MS);
+  Serial.println("[7/8] Multicore...");
+  multicore = testMulticore();
 
-  Serial.println("[8/8] Stability...");
-  runStabilityTest(STABILITY_DURATION_MS);
+  Serial.println("[8/8] FreeRTOS + Stability...");
+  yieldRate = testYieldRate();
+  testStability();
 
-  monsterScore = calculateMonsterScore();
+  monsterScore = calculateScore();
+
+  // Always print local results before networking.
   printResults();
+
+  Serial.println("[SYSTEM] Local benchmark completed.");
 
   if (connectWiFi()) {
     uploadResults();
+  } else {
+    Serial.println("[SYSTEM] Upload skipped.");
   }
 
-  Serial.println();
-  Serial.println("[DONE] Benchmark run finished.");
-  Serial.println("[DONE] Press EN to run it again.");
+  Serial.println("[DONE] Benchmark finished.");
 }
+
+// =====================================================
+// LOOP
+// =====================================================
 
 void loop() {
   delay(1000);
