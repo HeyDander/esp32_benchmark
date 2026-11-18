@@ -164,7 +164,7 @@ Enter your own Wi-Fi credentials and upload token:
 #define SERVER_URL      "https://esp32-benchmarksite.onrender.com/api/benchmark"
 
 #define UPLOAD_TOKEN    "9b12763b31c8d9254170254bcd47f15441e7b88b4788b5069a40cc1c670d691a"
-#define BOARD_MODEL     "ESP32-WROOM-32"
+#define BOARD_MODEL     "your_esp32_model"
 ```
 
 Configuration options:
